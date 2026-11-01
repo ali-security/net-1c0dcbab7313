@@ -1,0 +1,155 @@
+# Seal build: upstream golang.org/x/net has no GitHub Actions CI (it is tested
+# on Go's LUCI builders with `go test ./...`). This workflow builds the module,
+# packs the proxy-style module zip, and runs the full test suite.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run instead of the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+
+      - name: Go version
+        run: go version && go env
+
+      - name: Build
+        run: |
+          go mod download
+          go build ./...
+
+      - name: Pack module zip
+        run: |
+          mkdir -p /tmp/modzip /tmp/srccopy dist
+          cp -a . /tmp/srccopy/net
+          # Our CI workflow is not part of the upstream module; keep it out of the zip.
+          rm -f /tmp/srccopy/net/.github/workflows/seal-build.yml
+          rm -rf /tmp/srccopy/net/dist
+          cat > /tmp/modzip/main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd /tmp/modzip
+          go mod init example.com/modzip
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.28.0
+          GOFLAGS=-mod=mod go run . golang.org/x/net v0.45.0 /tmp/srccopy/net "$GITHUB_WORKSPACE/dist/v0.45.0.zip"
+          unzip -l "$GITHUB_WORKSPACE/dist/v0.45.0.zip" | tail -n 3
+
+      - name: Configure loopback networking for the ipv4/ipv6/icmp tests
+        run: |
+          # The ipv6 tests look for a loopback interface with a routable
+          # (non-::1) IPv6 address via nettest.RoutedInterface, so give lo a
+          # link-local one; the icmp tests need non-privileged ICMP sockets for
+          # the runner's group. Loopback multicast stays at the Linux default
+          # (off): with it on, ipv4's source-specific multicast subtest blocks
+          # forever in ReadFrom and ipv6's ff02::114 write gets ENETUNREACH.
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          sudo ip -6 addr add fe80::1/64 dev lo
+          ip addr show dev lo
+          ip route show
+          ip -6 route show table all dev lo
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -o pipefail
+          RUN_ARGS=()
+          if [ -n "$TEST_FILTER" ]; then
+            RUN_ARGS=(-run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$")
+          fi
+          # icmp, ipv4 and ipv6 open ip4:/ip6: protocol sockets (e.g.
+          # TestPacketConnConcurrentReadWriteUnicast/IP), which need CAP_NET_RAW,
+          # so those three packages run as root; the rest runs as the runner user.
+          PRIV="golang.org/x/net/icmp golang.org/x/net/ipv4 golang.org/x/net/ipv6"
+          UNPRIV=$(go list ./... | grep -v -x -F -e golang.org/x/net/icmp -e golang.org/x/net/ipv4 -e golang.org/x/net/ipv6)
+          : > /tmp/test.json
+          : > /tmp/test.log
+          go test -json -count=1 -timeout 3m "${RUN_ARGS[@]}" $UNPRIV \
+            | tee -a /tmp/test.json | jq -j --unbuffered 'select(.Action=="output") | .Output' | tee -a /tmp/test.log
+          sudo env "PATH=$PATH" HOME=/root GOCACHE=/tmp/root-gocache GOMODCACHE="$(go env GOMODCACHE)" \
+            GOFLAGS=-mod=readonly GOTOOLCHAIN=local \
+            go test -json -count=1 -timeout 3m "${RUN_ARGS[@]}" $PRIV \
+            | tee -a /tmp/test.json | jq -j --unbuffered 'select(.Action=="output") | .Output' | tee -a /tmp/test.log
+          if [ -n "$TEST_FILTER" ]; then
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/test.log || { echo "selected test $t did not run"; exit 1; }
+            done
+          fi
+
+      - name: Test summary
+        if: always()
+        run: |
+          echo "===== Test summary ====="
+          jq -rs '
+            def n(a): map(select(.Test != null and .Action == a)) | length;
+            "Packages ok:    \(map(select(.Test == null and .Action == "pass")) | length)",
+            "Packages FAIL:  \(map(select(.Test == null and .Action == "fail")) | length)",
+            "Tests passed:   \(n("pass"))",
+            "Tests failed:   \(n("fail"))",
+            "Tests skipped:  \(n("skip"))"
+          ' /tmp/test.json
+          echo "Note: 'not supported on linux/<arch>' skips come from nettest.SupportsRawSocket, which"
+          echo "probes socket(AF_INET[6], SOCK_RAW, 0); Linux rejects protocol 0 for raw sockets, so"
+          echo "those raw-IP tests skip on every Linux host (root or not), upstream's builders included."
+          echo "Note: 'no available interface' / 'not available on linux' skips in ipv4/ipv6 multicast tests:"
+          echo "nettest.RoutedInterface needs a loopback with the MULTICAST flag, which Linux lo lacks by"
+          echo "default. Turning it on (ip link set lo multicast on + 224.0.0.0/4 route) was tried: the"
+          echo "232.0.1.254/src=127.0.0.1 SSM subtest then hangs in ReadFrom until the test timeout and the"
+          echo "ipv6 ff02::114 write fails with ENETUNREACH, so loopback multicast is left off on this runner."
+          echo "===== Skipped tests (package, name, reason) ====="
+          jq -rs '
+            (map(select(.Test != null and .Action == "output"))
+              | group_by(.Package + " " + .Test)
+              | map({key: (.[0].Package + " " + .[0].Test), value: (map(.Output) | join(""))})
+              | from_entries) as $out
+            | map(select(.Test != null and .Action == "skip"))[]
+            | "SKIP \(.Package) \(.Test): "
+              + (($out[.Package + " " + .Test] // "")
+                 | split("\n")
+                 | map(select(test("^\\s*(=== |--- )") | not) | select(length > 0) | sub("^\\s+"; ""))
+                 | if length == 0 then "(no skip message logged)" else join(" | ") end)
+          ' /tmp/test.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-module-zip
+          path: dist/v0.45.0.zip
+          if-no-files-found: error
